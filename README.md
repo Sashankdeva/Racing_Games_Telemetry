@@ -1,259 +1,375 @@
-# Racing Haptic Engine
+# F1 Race Engineer & Telemetry Assistant
 
-A Windows desktop application that turns racing-game telemetry into
-realistic haptic feedback on an ordinary gamepad. Built and tuned for the
-**Cosmic Byte Blitz Dual Mode** over its 2.4 GHz dongle, driven through
-**direct XInput** — no vJoy, ViGEm, vXbox, pyxinput, virtual controllers or
-firmware modifications.
+A personal race engineer for **F1 25** and **F1 26**. Reads live UDP
+telemetry on your own PC and turns it into lap analysis, tyre and stint
+modelling, race intelligence, pit strategy, driving feedback and
+cross-session progression.
 
-F1 is the first supported game. The engine itself is game-agnostic.
+It is a normal desktop window. There is no in-game overlay, no injection
+into the game, and no language model anywhere in the decision path —
+every recommendation comes from a deterministic rule or an explicit cost
+model you can read in the source.
 
-![Dashboard](docs/dashboard.png)
+> **What is verified, honestly.** Packet reception and decoding have been
+> tested against real F1 26 game packets. Everything downstream — laps,
+> stints, strategy, coaching, suggestions, history — is verified against
+> synthetic and replayed telemetry only. See
+> [Verification status](#verification-status) for the exact split.
 
 ---
 
-## Quick start
+## Installation
+
+Developed and tested on **Python 3.14** on Windows 11. The only
+requirements are PySide6 6.6+ and pytest.
 
 ```bash
 python -m venv .venv
 ```
 
 ```bash
-.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python -m pip install -r requirements.txt
 ```
+
+Nothing is installed system-wide and nothing is written to the install
+directory. User data lives in `%APPDATA%\F1RaceEngineer`.
+
+## Running the application
 
 ```bash
 .venv\Scripts\python -m app.main
 ```
 
-Other entry points:
-
-```bash
-.venv\Scripts\python -m app.main --selftest
-```
-
 | Flag | Purpose |
 | --- | --- |
 | *(none)* | Launch the GUI |
-| `--selftest` | Start every subsystem, print a status report, exit |
-| `--diagnose` | Trace the telemetry pipeline stage by stage, then exit |
-| `--headless` | Run the engine with no UI |
+| `--selftest` | Start every subsystem, report status, exit |
+| `--diagnose` | Trace the telemetry pipeline stage by stage, exit |
+| `--headless` | Run telemetry with no UI |
 | `--verbose` | Debug logging |
-| `--port N` | Override the telemetry UDP port |
+| `--port N` | Override the telemetry UDP port **for this run only** |
+| `--mode f1_25\|f1_26` | Start in a specific game mode, for this run only |
 
-### Telemetry not arriving?
+`--port`, `--mode` and `--selftest` never write to your saved settings. A
+one-off `--port 20800` must not quietly become the port the app listens on
+tomorrow.
 
-```bash
-python -m app.main --diagnose --diagnose-seconds 15
-```
+**Launch only once.** The receiver binds the UDP port exclusively, so a
+second copy refuses the port loudly instead of silently receiving nothing.
 
-Close the app first — the probe needs the port exclusively. It reports which
-stage the data stops at, and names the process holding the port if the bind
-fails. The same figures are on the app's Diagnostics page while it runs.
+---
 
-The pipeline state is reported as a ladder rather than a single "connected"
-flag, because each rung means a different problem:
+## Telemetry configuration
 
-| Stage | Meaning |
-| --- | --- |
-| `0/5 Error` | Port held by another process |
-| `1/5 Waiting` | Listener not started |
-| `2/5 UDP socket bound` | Listening, **zero packets** — game config issue |
-| `3/5 Packets received` | Bytes arriving but not parsing — version mismatch |
-| `4/5 Telemetry valid` | Frames parsed, then went quiet |
-| `5/5 Telemetry live` | Working |
-
-Most common causes of `2/5`: UDP Telemetry off in game, wrong IP/port, or
-simply **sitting in the menus** — F1 only streams during an active session.
-If the game is sending to a different port, a background scan of the usual
-alternatives will detect it and say so on the Games page.
-
-### Connecting F1
+### F1 25 setup
 
 In game: **Settings → Telemetry Settings**
 
 | Setting | Value |
 | --- | --- |
-| UDP Telemetry | On |
-| UDP Broadcast Mode | Off |
-| UDP IP Address | `127.0.0.1` (or this PC's IP if the game runs elsewhere) |
-| UDP Port | `20777` (must match the Games page) |
-| UDP Send Rate | 60 Hz |
-| UDP Format | 2023, 2024 or 2025 |
+| UDP Telemetry | **On** |
+| UDP Broadcast Mode | **Off** |
+| UDP IP Address | `127.0.0.1` |
+| UDP Port | `20777` |
+| UDP Send Rate | `60 Hz` |
+| UDP Format | `2025` |
 
-Supported packet formats: **F1 22, 23, 24, 25**.
+### F1 26 setup
+
+Identical, with **UDP Format `2026`**. Select **F1 26** in the app's
+sidebar so the mode's own settings, car list, track list and stored
+sessions are used.
+
+Two details found by testing against the real game, not assumed:
+
+- **F1 26 sends 24 cars per packet array**, where earlier titles sent 22.
+  The parser does not hardcode either. It solves the car count and stride
+  arithmetically from the payload size and validates the result, then
+  caches the winner.
+- The app accepts packet formats by **range**, not an allowlist. An
+  allowlist silently rejected every format-2026 packet, which looks
+  exactly like the game not sending at all.
+
+If the game sends a format the selected mode did not expect, Diagnostics
+flags it and telemetry keeps parsing anyway. A mode mismatch is a warning,
+never a failure.
+
+### The pipeline is a ladder, not a boolean
+
+"Socket is open" and "data is arriving" are different problems, and only
+an explicit ladder makes that visible:
+
+| Stage | Meaning |
+| --- | --- |
+| `0/6 Error` | Port held by another process |
+| `1/6 Waiting` | Listener not started |
+| `2/6 UDP socket bound` | Listening, **zero packets** — game config issue |
+| `3/6 Packets received` | Bytes arriving but none parse — version mismatch |
+| `4/6 Packets parsed` | Decoding, no complete frame yet |
+| `5/6 Telemetry valid` | Frames produced, then went quiet |
+| `6/6 Telemetry live` | Working |
+
+### Live, stale, and no data
+
+Three states, never two:
+
+| State | Meaning | On screen |
+| --- | --- | --- |
+| `NO DATA` | Nothing has ever arrived | Blank |
+| `LIVE` | Telemetry is arriving | Current values |
+| `STALE` | Telemetry stopped | **Last known values, marked stale** |
+
+Going stale never blanks the screen and never rewrites history. A lap you
+completed is a fact; it does not stop being a fact because the next packet
+failed to arrive.
 
 ---
 
-## The haptic philosophy
+## Car selection
 
-The Blitz has ordinary ERM (eccentric rotating mass) motors. They accept
-amplitude only — there is no frequency channel — and they have real
-mechanical limits. The engine is designed around three facts about that
-hardware:
+**Car** page. Each mode has its own car list, under
+`%APPDATA%\F1RaceEngineer\modes\<mode>\cars`. Ratings shipped with the app
+are **priors** — starting assumptions, flagged as such, carrying low
+confidence. They are
+never presented as measured fact and never overwrite what your own driving
+measures. You can edit any record and reset it to the shipped values.
 
-**1. The motor already smooths the signal.** An ERM rotor takes ~50 ms to
-spin up and longer to coast down. That is a low-pass filter you get for
-free. Adding a heavy software filter on top is the single fastest way to
-make a haptic engine feel late and mushy, so **global smoothing is off by
-default** and the motor model's slew limits are deliberately fast enough to
-pass a transient essentially untouched.
+## Track selection
 
-**2. Smoothing must be per-effect, never global.** A gear shift needs a
-sub-10 ms attack. Body float over a crest wants a few Hz of filtering. One
-filter across the sum cannot serve both, and flattens them into the same
-texture. Every effect therefore owns its own signal character — modulation
-rate, waveform sharpness, envelope, and whether it filters at all.
+**Track** page, same arrangement, under `modes\<mode>\tracks` in the same
+place.
 
-**3. The bottom of the range is wasted.** Below roughly 0.15 drive the
-rotor never breaks static friction. The motor model maps the usable range
-onto real motion (`min_effective`) so subtle effects are actually felt
-instead of vanishing into silence.
+### Where a number came from
 
-### Why the engine feels like an engine
+Every value the app shows is labelled with its origin, and these never
+blur together:
 
-The RPM effect is the least-filtered thing in the codebase. Modulation rate
-scales with revs on an **exponent above 1**, so the *rate of change itself*
-grows toward the redline — 7000 → 8000 → 9000 rpm is unmistakable rather
-than a uniform buzz. Measured across the band:
-
-| Engine speed | Modulation rate | Character |
-| --- | --- | --- |
-| Idle / low | ~7 Hz | Slow, countable, distinct pulses |
-| Mid | ~18 Hz | Pulses merging into a rhythm |
-| High | ~26–32 Hz | Aggressive continuous buzz that still has texture |
-| Rev limiter | 20 Hz hard gate | A stuttering on/off — categorically different, not just "more" |
-
-Modulation *depth* narrows as revs rise (deep pulses low down, a tighter
-band on a high base up top), which is what makes the top end read as urgent
-rather than merely loud.
-
-### Per-effect character
-
-| Effect | Signal design |
+| Source | Meaning |
 | --- | --- |
-| **Engine / RPM** | Minimal filtering; rate and level both climb, rate accelerates near redline |
-| **Gear shift** | Single-tick attack, ~100 ms total. An impact, not a vibration |
-| **Kerbs** | Rib-crossing rate derived from road speed; hard edges; per-wheel left/right |
-| **ABS / wheel lock** | Hard square gate at ~16 Hz with a few percent rate jitter, so it feels like hydraulics rather than a tone |
-| **Wheelspin** | Rate climbs steeply with slip, noise folded in so it never settles — traction loss should feel nervous |
-| **Collision** | Priority 100, dominance 1.0 — briefly owns both motors. Instant attack, severity-scaled decay, then silence |
-| **Surface** | Noise-driven, not periodic. Gravel uses sample-and-hold (jagged), grass interpolated (softer) |
-| **Suspension** | The one effect that genuinely low-passes (9 Hz) — body motion is a few Hz and would otherwise fizz |
-| **Braking** | Responsive to the pedal, held back so it never masks ABS |
-| **Acceleration** | Reads measured g, not throttle position; lateral load routed to the outside motor |
-| **Road texture / speed** | The quietest bed; builds with speed |
+| `PROFILE` | Shipped or user-edited prior |
+| `OBSERVED` | Measured from your own sessions, with sample count |
+| `INFERENCE` | A conclusion drawn from the above — always labelled, never stated as fact |
 
-### How simultaneous effects are combined
+Observed data is written to `modes/<mode>/observed/` and never overwrites a
+profile. Laps run in traffic, in the wet, behind a safety car, on an
+in-lap, or with unusual fuel burn are excluded before anything is learned
+from them, because those describe the conditions rather than the car.
 
-Naive summing pins everything at 1.0 and every event feels identical.
-Naive `max()` means only the loudest effect is ever felt. The mixer does
-neither: effects are applied strongest-priority-first and each consumes
-*headroom* proportional to its own amplitude and its `dominance`.
+---
 
-- A full-strength collision (dominance 1.0) leaves no headroom — it owns the controller.
-- The engine bed (dominance 0.22) barely ducks anything, so kerbs and shifts punch straight through it.
-- The result is soft-limited above 0.85 rather than clipped, so contrast survives.
+## Smart Suggestions
+
+**Suggestions** page, with the single most important one mirrored on the
+Dashboard.
+
+Suggestions are arbitrated, not stacked. Every engine below can produce
+advice at the same time, and a driver reading a list mid-corner reads
+nothing — so they compete on category, severity and priority, and only the
+winner reaches the driving view. Each carries its confidence and an
+explanation of what it was derived from. Nothing repeats: every suggestion
+has a cooldown and a lifecycle.
+
+## Strategy
+
+**Strategy** page. A deterministic cost model, stated in the source:
+
+```
+stay out            d_now * sum(age+1 .. age+R)
+pit after k laps    d_now * sum(age+1 .. age+k)
+                    + pit_loss
+                    + d_next * sum(1 .. R-k)
+```
+
+where `d` is measured degradation per lap and `R` is the laps remaining.
+Traffic and track position are weighted in explicitly. The safety-car pit
+loss factor is a **stated modelling assumption**, not a measurement, and
+it caps the confidence of any recommendation that depends on it below
+`HIGH`.
+
+Strategy can never be more confident than the tyre model it rests on. That
+is enforced by a test, not by convention.
+
+## Driver Coach
+
+**Driver** page. Reports where time is going, and whether it is improving.
+
+It works from sector times and your own bests — never from a reference lap
+it does not have. It will not name a corner or a braking distance, because
+the telemetry does not identify corners. Every observation is labelled
+either `MEASURED DIRECTLY` or `CORRELATION — NOT PROOF OF CAUSE`, and time
+loss is reported as the mean across the slow laps rather than a worst case.
+
+Problems are kept for the whole session, including after telemetry stops.
+
+## History
+
+**History** page. Sessions are stored per mode in
+`modes/<mode>/sessions/`, one file each, and **nothing is ever
+auto-deleted**.
+
+The record is written after **every completed lap**, not at shutdown, so a
+crash, a power cut or a killed game costs at most the lap in progress
+rather than the session. Two sessions are only compared when the mode, car
+and track match.
+
+Progression across sessions needs several comparable sessions before it
+will say anything at all; until then it says `INSUFFICIENT DATA` rather
+than reporting noise as a trend.
+
+---
+
+## Recording
+
+Captures **raw packets exactly as the game sent them** — nothing parsed on
+the way in. A recording is therefore ground truth about the wire format
+even if the parser is wrong.
+
+```
+Inspector -> Start Recording -> drive 30-60s -> Stop
+```
+
+## Replay
+
+Feeds those bytes to the *same* adapter method the UDP listener calls.
+There is no second parsing path, so a bug found in replay is the real bug.
+
+```
+Inspector -> pick a recording -> Load -> Play  (or Step, one packet at a time)
+```
+
+Live and replay are mutually exclusive: two sources feeding one normalized
+state would be impossible to reason about.
+
+---
+
+## Diagnostics
+
+**Diagnostics** page — raw packet counts, parse counts, packet rate,
+bytes/s, per-packet-type breakdown, and a RAW vs NORMALIZED vs UI
+comparison table that localises a bad value to the parser, the adapter or
+the UI binding in one glance.
+
+**Inspector** page — per field: is it present, is it changing, what range
+has been seen.
+
+| Verdict | Meaning |
+| --- | --- |
+| `OK` | Present and changing |
+| `STATIC` | Arrived but never changed — may be legitimate, may be a bad offset |
+| `ABSENT` | Arrived but always zero/empty — usually a missing packet |
+| `NO DATA` | No frame carrying it yet |
+
+`STATIC` is the verdict that matters. The parsing failure that cost the
+most time on this project looked perfectly healthy, because it was a
+plausible constant.
+
+---
+
+## Troubleshooting
+
+**Stage stuck at `2/6` — bound, but no packets.**
+The game is not sending. Check UDP Telemetry is On, the IP is `127.0.0.1`,
+the port matches, and that you are **in a session** — F1 does not stream
+from the menus.
+
+**Stage stuck at `3/6` — packets arrive, none parse.**
+A format mismatch. Run `--diagnose` and read the reported packet format,
+then set the matching game mode.
+
+**Stage `0/6` — port held by another process.**
+A second copy of the app is running, or a previous run did not exit. Close
+it. The exclusive bind is deliberate: without it a second listener
+silently steals packets on Windows and both copies appear broken.
+
+**Values frozen on screen.**
+They are not frozen, they are `STALE` and labelled as such. Telemetry
+stopped; the last known values are kept deliberately.
+
+**Everything reads `UNAVAILABLE` on the Race page for the car behind.**
+Expected. Only the player's own lap data is decoded — see
+[Known limitations](#known-limitations).
+
+**The app closed with an error dialog.**
+The full traceback is written to
+`%APPDATA%\F1RaceEngineer\logs\f1_race_engineer.log`.
+
+**Diagnosing without launching the app:**
+
+```bash
+.venv\Scripts\python -m app.main --diagnose
+```
+
+This binds only for the probe, never starts the engine, and never takes
+the port the app would use.
 
 ---
 
 ## Architecture
 
-The haptic engine never imports anything game-specific. Adapters translate
-their game's packets into a normalized `TelemetryFrame`; effects consume
-only that.
-
 ```
 app/
-  main.py                    entry point (GUI / headless / selftest)
+  main.py                    entry point (GUI / headless / selftest / diagnose)
   core/
     application.py             composition root and lifecycle
     models.py                  TelemetryFrame - the game-agnostic contract
-    events.py                  thread-safe event bus
-    logging.py                 logging + ring buffer for Diagnostics
-    paths.py                   %APPDATA% locations
-  controller/
-    base.py                    ControllerBackend ABC (+ NullController)
-    xinput.py                  ctypes XInput bindings
-    blitz.py                   XInput controller implementation
-    device_manager.py          hot-plug detection, disconnect cutoff
-  haptics/
-    signal.py                  oscillators, noise, envelopes, filters
-    motor.py                   ERM physical model
-    mixer.py                   priority ducking + soft limiter
-    engine.py                  the 120 Hz loop and safety watchdogs
-    scheduler.py               manual/one-shot cues
-    patterns.py                Test Lab patterns
-    effects/                   11 effects, each with its own character
+    telemetry_state.py         LIVE / STALE / NO_DATA, thread-safe
+    events.py, logging.py, paths.py
   games/
-    base.py                    GameAdapter ABC
-    registry.py                available adapters
+    base.py                    GameAdapter ABC + pipeline stage ladder
+    modes.py                   GameMode, capabilities, version config
     f1/                        packets, parser, UDP listener, adapter
-    forza/                     placeholder - see below
-  profiles/                    schema, defaults, CRUD, import/export
-  config/settings.py           application settings
-  diagnostics/metrics.py       health collection
-  ui/                          Qt theme, widgets, 8 pages
-tests/                         254 tests
+    forza/                     placeholder, honestly reported as unsupported
+  diagnostics/                 health collection + standalone probe
+  config/
+    settings.py                global settings (active mode, window, logging)
+    mode_settings.py           per-mode settings (port, units, preferences)
+  telemetry/
+    recording.py               raw packet capture (.f1re container)
+    replay.py                  deterministic playback through the live path
+    inspector.py               per-packet and per-field validation
+  domain/
+    driver_session.py          lap/behaviour collection, no inference
+    lap_analysis.py            lap classification, outliers, confidence
+    stints.py                  stint construction and degradation
+    race_intelligence.py       gaps, attack/defence, DRS, race phase
+    strategy.py                pit cost model
+    driver_coach.py            where time is going
+    profile_intelligence.py    PROFILE / OBSERVED / INFERENCE
+    session_history.py         sessions, personal bests, progression
+    smart_suggestions.py       arbitration across every engine above
+    car_profiles.py            car performance priors
+    store.py                   editable JSON record store
+    track_profiles.py          circuit characteristics
+  ui/                          theme, widgets, 16 pages
+tests/                         760 tests
 ```
 
-### Threading
+Only the adapter parses packets. No analysis module imports the parser or
+unpacks bytes — enforced by a test, because two layers interpreting the
+same bytes is how they start disagreeing.
 
-Four independent threads, so nothing can stall motor output:
+Telemetry runs on its own thread and writes to `TelemetryState`; the UI
+polls an immutable snapshot at 20 Hz. Analysis runs on **lap completion**,
+never per packet.
 
-| Thread | Rate | Role |
-| --- | --- | --- |
-| Haptic engine | 120 Hz | Effects → mixer → motor model → XInput |
-| Telemetry | packet-driven | UDP receive and parse |
-| Device manager | 1 Hz | Hot-plug detection |
-| Qt UI | 30 Hz | Polls an immutable snapshot — never touches the loop |
+The session clock is derived from frames observed, not wall time, so a
+replay produces exactly the same conclusions as the live run that recorded
+it.
 
-Measured: **~116 Hz sustained** against a 120 Hz target with the dashboard
-visible and telemetry at 60 Hz.
+### Per-mode isolation
 
-### Adding a game
+Settings, cars, tracks, learned profiles and stored sessions all live
+under `modes/<mode>/`. F1 25 and F1 26 share no path, so switching modes
+cannot overwrite the other mode's data and switching back restores it
+exactly. That is a storage guarantee, covered by tests, not a convention.
 
-1. Subclass `GameAdapter`, translate the game's telemetry into `TelemetryFrame`.
-2. Register it in `games/registry.py`.
+### Storage safety
 
-Nothing in `app/haptics/` changes. Every existing effect works the moment
-frames start arriving. `games/forza/adapter.py` documents exactly what a
-Forza implementation would involve — it reports itself as unsupported and
-produces no telemetry rather than faking a connection.
-
----
-
-## Safety
-
-The one guarantee: **the motors stop.**
-
-| Mechanism | Trigger |
-| --- | --- |
-| Emergency stop | User (dashboard, Controller page, or tray menu); latches until cleared |
-| Stale telemetry cutoff | Data older than the timeout — effects fall silent on their own |
-| Controller disconnect | `DeviceManager` event cuts output immediately |
-| Loop watchdog | Separate thread force-stops the hardware if the loop stalls with motors live |
-| Exception safety | A failing tick silences the motors and the loop survives |
-| Shutdown | `finally` in `main()`; idempotent; always ends silent |
-| Output limit | Hard ceiling applied last, after everything else |
-| Test Lab cap | Manual patterns are duration-limited by the scheduler |
-
-Stale telemetry is the important one in practice: if the game closes, alt-tabs,
-or the network drops, frozen data can never keep the motors running.
-
----
-
-## Profiles
-
-Five ship with the app: **Default**, **F1 Realistic**, **F1 Strong**,
-**F1 Subtle**, **Custom**. Default is tuned to feel right immediately — no
-tuning required.
-
-Stored as JSON under `%APPDATA%\RacingHapticEngine\profiles`. Writes are
-atomic. Loading is deliberately tolerant: unknown keys are ignored, missing
-keys default, out-of-range values are clamped, and a corrupt file is skipped
-rather than being fatal. Built-in profiles cannot be deleted — only reset —
-so a known-good configuration is always one click away.
+Every data file is written to a uniquely-named temporary file and renamed
+into place. Readers and writers share a lock, because on Windows replacing
+a file that another thread holds open fails outright — which loses the
+save silently. A corrupt file is skipped with a warning rather than taking
+the rest of the history down with it.
 
 ---
 
@@ -263,44 +379,53 @@ so a known-good configuration is always one click away.
 .venv\Scripts\python -m pytest
 ```
 
-254 tests. Hardware-dependent tests skip automatically when no controller
-is attached, and become active when one is.
-
-Coverage includes: XInput wrapper and controller abstraction, motor model
-(dead zone, curve, slew, NaN rejection), signal primitives, all 11 effects
-(asserting *character* — that engine rate rises with revs, that kerbs return
-to silence between ribs, that gravel is irregular rather than periodic),
-mixer priority/ducking/limiting, F1 packet parsing against byte-exact
-spec-built packets, malformed and truncated packet handling, collision
-derivation (including that hard braking is *not* read as a collision),
-telemetry timeout, emergency stop, watchdog, profiles and settings
-persistence, and full-engine integration with several effects live at once.
+**760 tests, all passing.** Packet parsing against byte-exact spec-built
+packets; malformed, truncated and hostile input; version tolerance; the
+stage ladder; exclusive bind; burst handling; a full field trace over a
+real UDP socket; staleness; settings persistence; per-mode isolation;
+recording round-trip fidelity; replay determinism; inspector verdicts; lap
+classification; stint degradation; race intelligence; the strategy cost
+model; coaching evidence; profile source separation; session history and
+progression; suggestion arbitration and cooldowns; and an integration
+suite covering the seams between all of them.
 
 ---
 
 ## Verification status
 
-| Verified | How |
-| --- | --- |
-| XInput rumble on real hardware | Physical Blitz on slot 0 — left/right/both pulses and ramps confirmed by the user |
-| UDP telemetry pipeline | Real socket, spec-built F1 23 packets, 4 packet types → one normalized frame, 0 rejections |
-| Engine loop under UI load | ~116 Hz sustained against a 120 Hz target |
-| All 8 UI pages | Constructed, refreshed and screenshotted with live synthetic telemetry |
-| Application startup/shutdown | `--selftest` passes; shutdown always ends with motors silent |
+The distinction below is deliberate and worth reading before trusting any
+number this application shows you.
 
-**Not yet verified:** end-to-end feel with F1 actually running. The
-telemetry path is tested against spec-built packets rather than a live
-game, and the per-effect tuning values are engineering judgement — they will
-benefit from a real session on track.
+**Verified against real F1 game packets:**
 
----
+- UDP reception from a running F1 26 session
+- Packet header and format decoding (format 2026 identified correctly)
+- The 24-car array layout in F1 26, and the stride solver that finds it
+- Packet-rate and packet-type accounting in Diagnostics
 
-## Requirements
+**Verified against synthetic and replayed telemetry only:**
 
-- Windows (XInput)
-- Python 3.11+ (developed on 3.14)
-- PySide6
+- Every field value beyond the header (verified byte-exact against the
+  published spec over a real socket, but not yet cross-checked against a
+  live session's on-screen values)
+- Lap and sector analysis, tyre and stint modelling
+- Race intelligence, strategy, driver coach
+- Smart suggestion arbitration, session history and progression
 
-The app degrades safely without hardware: if XInput is unavailable or no
-controller is attached, it still runs, reports the situation honestly on the
-Dashboard and Diagnostics pages, and never pretends to be connected.
+Nothing in the second list is claimed to be validated in a real race. It
+is claimed to be correct with respect to its inputs, and tested as such.
+
+## Known limitations
+
+- **Safety car and VSC are never detected.** The field exists and is wired
+  through every consumer, but no adapter populates it, so every
+  safety-car-aware behaviour is currently unreachable in a real session.
+- **No opponent data.** Only the player's own lap data slice is decoded.
+  The gap to the car behind, defence state and undercut projection are
+  therefore reported as `UNAVAILABLE`, not estimated.
+- **F1 26 tyre thermal data is unconfirmed.** The layout is recovered by a
+  validated offset search rather than a documented offset, and has not
+  been checked against a real F1 26 session.
+- Corners are not identified, so coaching speaks in sectors.
+- Windows only, in practice — the UDP and storage behaviour is written and
+  tested against Windows semantics.

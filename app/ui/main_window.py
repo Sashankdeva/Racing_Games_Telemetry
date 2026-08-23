@@ -1,11 +1,9 @@
 """Main window: sidebar, page stack, and the single refresh timer.
 
 One timer drives the whole UI and it only refreshes the page that is
-actually visible, so hidden pages cost nothing. The timer runs at 30 Hz -
-fast enough for the meters to look live, slow enough to stay far away from
-the 120 Hz haptic thread it is merely observing.
-
-The UI never touches the haptic loop: it polls an immutable snapshot.
+actually visible, so hidden pages cost nothing. It runs at 20 Hz, which is
+ample for telemetry readouts and keeps the UI thread clear of the telemetry
+receiver, which it only ever observes through an immutable snapshot.
 """
 
 from __future__ import annotations
@@ -29,7 +27,7 @@ from app.ui.widgets.nav import Sidebar
 
 _log = get_logger(__name__)
 
-UI_REFRESH_HZ = 30
+UI_REFRESH_HZ = 20
 
 
 class MainWindow(QMainWindow):
@@ -38,7 +36,7 @@ class MainWindow(QMainWindow):
         self.app = app
         self._quitting = False
 
-        self.setWindowTitle("Racing Haptic Engine")
+        self.setWindowTitle(f"F1 Race Engineer - {app.game.display_name}")
         self.setMinimumSize(1180, 760)
         self.resize(1380, 880)
         self.setWindowIcon(_build_icon())
@@ -52,6 +50,8 @@ class MainWindow(QMainWindow):
 
         self.sidebar = Sidebar([page.title for page in self._pages])
         self.sidebar.pageSelected.connect(self._on_page_selected)
+        self.sidebar.modeChanged.connect(self._on_mode_changed)
+        self.sidebar.set_mode(app.mode.value)
         layout.addWidget(self.sidebar)
 
         self.stack = QStackedWidget()
@@ -77,16 +77,12 @@ class MainWindow(QMainWindow):
             return None
 
         tray = QSystemTrayIcon(_build_icon(), self)
-        tray.setToolTip("Racing Haptic Engine")
+        tray.setToolTip("F1 Race Engineer")
 
         menu = QMenu()
         show_action = QAction("Show Window", self)
         show_action.triggered.connect(self._restore_window)
         menu.addAction(show_action)
-
-        stop_action = QAction("Emergency Stop", self)
-        stop_action.triggered.connect(self.app.emergency_stop)
-        menu.addAction(stop_action)
 
         menu.addSeparator()
         quit_action = QAction("Quit", self)
@@ -114,6 +110,19 @@ class MainWindow(QMainWindow):
         page.on_shown()
         page.refresh(self.app.report())
 
+    def _on_mode_changed(self, mode_value: str) -> None:
+        """Switch game mode live - no restart.
+
+        Everything version-specific is reloaded by the Application; the
+        pages simply re-read their state afterwards.
+        """
+        from app.games.modes import GameMode
+
+        self.app.set_mode(GameMode.parse(mode_value))
+        self.setWindowTitle(f"F1 Race Engineer - {self.app.game.display_name}")
+        self.reload_pages()
+        self._refresh()
+
     def reload_pages(self) -> None:
         """Re-read the active profile into every page (after a profile switch)."""
         for page in self._pages:
@@ -126,20 +135,27 @@ class MainWindow(QMainWindow):
             _log.exception("Diagnostics collection failed")
             return
 
-        engine = report.engine
-        if engine.emergency_stop:
-            status = "EMERGENCY STOP"
-        elif not report.controller_connected:
-            status = "No controller"
-        elif report.adapter and report.adapter.connected:
-            status = "Telemetry live"
-        elif engine.running:
-            status = "Running"
+        adapter = report.adapter
+        if report.stale:
+            # Distinct from every pipeline stage: the socket may be fine and
+            # the game simply paused.
+            status = f"STALE - {report.age:.1f}s since last update"
+        elif adapter is None:
+            status = "No adapter"
+        elif int(adapter.stage) >= 6:
+            # Frames/s, not packets/s - the latter is ~7x higher and reads
+            # as alarming when the feed is perfectly healthy.
+            status = f"Telemetry live - {adapter.frame_rate:.0f}/s"
         else:
-            status = "Idle"
+            status = adapter.stage.label
 
+        frame = report.frame
+        # Position survives a dropout; speed is only shown while live, since
+        # a stale speed reads as the car still moving.
         self.sidebar.update_status(
-            self.app.profiles.active.name, engine.left, engine.right, status
+            f"P{frame.position}" if frame.position else "-",
+            f"{frame.speed_kph:.0f} kph" if report.live else "",
+            status,
         )
 
         current = self.stack.currentWidget()
@@ -156,7 +172,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             self.hide()
             self._tray.showMessage(
-                "Racing Haptic Engine",
+                "F1 Race Engineer",
                 "Still running in the background. Right-click the tray icon to quit.",
                 QSystemTrayIcon.MessageIcon.Information,
                 2500,

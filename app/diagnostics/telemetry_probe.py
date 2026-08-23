@@ -95,6 +95,14 @@ class ProbeStats:
     frames_emitted: int = 0
     last_frame = None
 
+    # --- stage 6: does each field actually MOVE? ---
+    #: field name -> [min, max, distinct-value count]. A snapshot of the
+    #: last frame cannot distinguish "throttle is broken" from "you were
+    #: not on the throttle at that instant"; movement over the whole sample
+    #: can. This is what localises a wrong struct offset: a field frozen at
+    #: one value while its neighbours move is reading the wrong bytes.
+    field_movement: dict = field(default_factory=dict)
+
     def elapsed(self) -> float:
         if not self.first_packet_time:
             return 0.0
@@ -125,9 +133,46 @@ class TelemetryProbe:
         self._adapter.set_frame_callback(self._on_frame)
 
     # ------------------------------------------------------------------
+    #: Fields worth watching for movement, with the packet each comes from.
+    #: Grouped by source so a whole missing packet shows as a block of
+    #: STATIC rather than looking like several unrelated faults.
+    TRACKED = (
+        ("throttle", "CarTelemetry"),
+        ("brake", "CarTelemetry"),
+        ("steering", "CarTelemetry"),
+        ("speed_kph", "CarTelemetry"),
+        ("rpm", "CarTelemetry"),
+        ("gear", "CarTelemetry"),
+        ("clutch", "CarTelemetry"),
+        ("max_rpm", "CarStatus"),
+        ("fuel_in_tank", "CarStatus"),
+        ("ers_store_percent", "CarStatus"),
+        ("current_lap", "LapData"),
+        ("position", "LapData"),
+        ("lap_distance_m", "LapData"),
+        ("g_lateral", "Motion"),
+        ("g_longitudinal", "Motion"),
+    )
+
     def _on_frame(self, frame) -> None:
         self.stats.frames_emitted += 1
         self.stats.last_frame = frame
+
+        movement = self.stats.field_movement
+        for name, source in self.TRACKED:
+            value = getattr(frame, name, None)
+            if value is None:
+                continue
+            value = float(value)
+            entry = movement.get(name)
+            if entry is None:
+                # [source, min, max, distinct values seen (capped)]
+                movement[name] = [source, value, value, {value}]
+            else:
+                entry[1] = min(entry[1], value)
+                entry[2] = max(entry[2], value)
+                if len(entry[3]) < 500:
+                    entry[3].add(value)
 
     def bind(self) -> bool:
         """Bind WITHOUT SO_REUSEADDR so a port conflict is a hard error."""
@@ -306,7 +351,7 @@ def format_report(stats: ProbeStats) -> str:
                 add(f"    command        : {stats.holder_command}")
         add("")
         if stats.holder_is_this_app:
-            add("    -> This is the Racing Haptic Engine itself. The probe needs")
+            add("    -> This is the F1 Race Engineer itself. The probe needs")
             add("       exclusive use of the port, so close the app and re-run:")
             add("")
             add("         python -m app.main --diagnose --diagnose-seconds 15")
@@ -390,6 +435,31 @@ def format_report(stats: ProbeStats) -> str:
         add(f"    Surfaces       : {[s.name for s in frame.surfaces.as_tuple()]}")
         add(f"    Wheel slip     : {tuple(round(v, 3) for v in frame.wheel_slip_ratio.as_tuple())}")
         add(f"    G lat/lon      : {frame.g_lateral:+.2f} / {frame.g_longitudinal:+.2f}")
+
+    # --- stage 6 ---
+    if stats.field_movement:
+        add("")
+        add("[6] FIELD MOVEMENT   (did each value actually change?)")
+        add(f"    {'field':<20} {'source':<14} {'min':>10} {'max':>10}  verdict")
+        for name, source in TelemetryProbe.TRACKED:
+            entry = stats.field_movement.get(name)
+            if entry is None:
+                add(f"    {name:<20} {source:<14} {'-':>10} {'-':>10}  ABSENT")
+                continue
+            _, low, high, seen = entry
+            verdict = "MOVING" if len(seen) > 2 else "STATIC"
+            add(
+                f"    {name:<20} {source:<14} {low:>10.2f} {high:>10.2f}  "
+                f"{verdict} ({len(seen)} values)"
+            )
+        add("")
+        add("    STATIC means the value never changed during the sample.")
+        add("    Drive normally while this runs: use throttle, brake, steer and")
+        add("    change gear, so a genuinely-changing field has a chance to move.")
+        add("    A STATIC field surrounded by MOVING ones from the SAME source")
+        add("    packet means that field is being read at the wrong offset.")
+        add("    A whole source reading STATIC usually means that packet type")
+        add("    is not being sent by the game.")
 
     add("")
     add("=" * 66)

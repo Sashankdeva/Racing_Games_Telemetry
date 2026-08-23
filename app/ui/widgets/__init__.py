@@ -9,7 +9,7 @@ from app.ui.widgets.common import (
     StatusPill,
     ToggleSwitch,
 )
-from app.ui.widgets.meters import ActivityDot, HapticScope, MotorMeter, RpmBar
+from app.ui.widgets.meters import InputBar, RpmBar, TyreGrid
 from app.ui.widgets.nav import Sidebar
 
 __all__ = [
@@ -20,9 +20,8 @@ __all__ = [
     "StatBlock",
     "StatusPill",
     "ToggleSwitch",
-    "ActivityDot",
-    "HapticScope",
-    "MotorMeter",
+    "InputBar",
     "RpmBar",
+    "TyreGrid",
     "Sidebar",
 ]

@@ -1,12 +1,13 @@
 """The normalized telemetry model.
 
-This is the contract between game adapters and the haptic engine. Adapters
-translate their game's native packets into a TelemetryFrame; effects read
-only TelemetryFrame. Nothing below this line knows what F1 is.
+This is the contract between game adapters and everything above them.
+Adapters translate their game's native packets into a TelemetryFrame; the
+dashboard and analysis layers read only TelemetryFrame. Nothing above this
+line knows what F1 is.
 
-Design rule: fields an adapter cannot source are left as None rather than
-guessed. Effects check for None and degrade gracefully instead of reacting
-to invented data.
+Design rule: fields an adapter cannot source are left as None (or 0/"")
+rather than guessed. Consumers check before using them, so the app never
+presents invented data as measured.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ class SurfaceType(IntEnum):
 
     @property
     def is_loose(self) -> bool:
-        """Loose/low-grip surfaces that produce irregular, noisy vibration."""
+        """Loose/low-grip surfaces - gravel, sand, mud, rock."""
         return self in (
             SurfaceType.GRAVEL,
             SurfaceType.SAND,
@@ -59,7 +60,7 @@ class Wheels:
 
     Always constructed in explicit fl/fr/rl/rr terms. Games use different
     native orderings (F1 uses RL,RR,FL,FR) - adapters must map into these
-    named fields so no ordering assumption leaks into the effects.
+    named fields so no ordering assumption leaks into consumers.
     """
 
     fl: float = 0.0
@@ -153,6 +154,62 @@ class TelemetryFrame:
     g_longitudinal: float = 0.0
     g_vertical: float = 0.0
 
+    # --- tyres ------------------------------------------------------------
+    tyre_surface_temp: Wheels = field(default_factory=Wheels)  # deg C
+    tyre_inner_temp: Wheels = field(default_factory=Wheels)  # deg C
+    tyre_pressure: Wheels = field(default_factory=Wheels)  # psi
+    tyre_wear: Wheels = field(default_factory=Wheels)  # percent
+    brake_temp: Wheels = field(default_factory=Wheels)  # deg C
+    tyre_compound: str = ""
+    #: -1 means the game has not reported it.
+    tyre_age_laps: int = -1
+
+    # --- lap / position ---------------------------------------------------
+    position: int = 0
+    current_lap: int = 0
+    total_laps: int = 0
+    last_lap_time_s: float = 0.0
+    best_lap_time_s: float = 0.0
+    current_lap_time_s: float = 0.0
+    sector: int = 0
+    sector1_time_s: float = 0.0
+    sector2_time_s: float = 0.0
+    lap_distance_m: float = 0.0
+    #: Gaps in seconds; 0 when the game does not report them.
+    delta_to_car_ahead_s: float = 0.0
+    delta_to_leader_s: float = 0.0
+    lap_invalid: bool = False
+    penalties_s: int = 0
+
+    # --- fuel / ERS -------------------------------------------------------
+    fuel_in_tank: float = 0.0  # kg
+    fuel_capacity: float = 0.0  # kg
+    #: Laps of fuel remaining relative to target; negative means short.
+    fuel_remaining_laps: float = 0.0
+    ers_store_percent: float = 0.0
+    ers_mode: str = ""
+    ers_deployed_lap: float = 0.0
+    ers_harvested_lap: float = 0.0
+
+    # --- session / conditions --------------------------------------------
+    session_type: str = ""
+    track_name: str = ""
+    weather: str = ""
+    air_temperature: float = 0.0
+    track_temperature: float = 0.0
+    session_time_left_s: float = 0.0
+    safety_car: str = ""
+
+    # --- damage (percent) -------------------------------------------------
+    front_left_wing_damage: int = 0
+    front_right_wing_damage: int = 0
+    rear_wing_damage: int = 0
+    floor_damage: int = 0
+    diffuser_damage: int = 0
+    sidepod_damage: int = 0
+    gearbox_damage: int = 0
+    engine_damage: int = 0
+
     # --- derived / assist state ------------------------------------------
     # None means "this game did not tell us", not "false".
     abs_active: bool | None = None
@@ -160,6 +217,21 @@ class TelemetryFrame:
     rev_limiter_active: bool = False
     # 0..1 impact magnitude for this frame; adapters derive or read directly.
     impact: float = 0.0
+
+    def damage_summary(self) -> str:
+        """Human-readable list of damaged components, or '' if undamaged."""
+        parts = [
+            ("Front wing L", self.front_left_wing_damage),
+            ("Front wing R", self.front_right_wing_damage),
+            ("Rear wing", self.rear_wing_damage),
+            ("Floor", self.floor_damage),
+            ("Diffuser", self.diffuser_damage),
+            ("Sidepod", self.sidepod_damage),
+            ("Gearbox", self.gearbox_damage),
+            ("Engine", self.engine_damage),
+        ]
+        damaged = [f"{name:<14}{value:>3}%" for name, value in parts if value > 0]
+        return "\n".join(damaged)
 
     @property
     def rpm_ratio(self) -> float:
@@ -172,8 +244,9 @@ class TelemetryFrame:
     def rpm_band(self) -> float:
         """RPM mapped across the *usable* band (idle..redline) as 0..1.
 
-        More useful than rpm_ratio for haptics: an idling engine should sit
-        near 0 rather than at whatever fraction idle happens to be.
+        More useful than rpm_ratio for display and analysis: an idling
+        engine sits near 0 rather than at whatever fraction idle happens
+        to be.
         """
         if self.max_rpm <= 0.0:
             return 0.0
@@ -203,5 +276,5 @@ def _clamp(value: float, low: float, high: float) -> float:
     return low if value < low else high if value > high else value
 
 
-#: A frame representing "no game data". Effects treat this as silence.
+#: A frame representing "no game data".
 NO_TELEMETRY = TelemetryFrame(valid=False)

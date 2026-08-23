@@ -16,12 +16,11 @@ What implementing it would actually involve:
      per-wheel surface rumble, suspension travel, and g-forces.
   4. Register the class in games/registry.py.
 
-Nothing in app/haptics/ needs to change - effects consume TelemetryFrame
-only, so every existing effect works the moment frames start arriving. The
-one honest gap is surface classification: Forza reports a normalized rumble
-value per wheel rather than F1's surface enum, so `surfaces` should be left
-UNKNOWN and the surface effect driven from that value instead of inventing
-a category.
+Nothing downstream needs to change - consumers read TelemetryFrame only,
+so the dashboard and analysis layers work the moment frames start arriving.
+The one honest gap is surface classification: Forza reports a normalized
+rumble value per wheel rather than F1's surface enum, so `surfaces` should
+be left UNKNOWN rather than inventing a category.
 """
 
 from __future__ import annotations

@@ -52,7 +52,67 @@ SUPPORTED_FORMATS = KNOWN_FORMATS
 def is_supported_format(packet_format: int) -> bool:
     return MIN_PACKET_FORMAT <= packet_format <= MAX_PACKET_FORMAT
 
+#: Historic array size. F1 22-25 carry 22 cars; F1 26 (packet format 2026)
+#: carries 24. Kept as the default for the layouts verified against the
+#: published spec, but NEVER assumed when deriving a stride - see
+#: candidate_strides().
 MAX_CARS = 22
+
+#: Array sizes to consider when solving a packet's per-car stride. Ordered
+#: by how likely each is; the plausibility checks decide the winner, so
+#: order only affects how quickly the right one is found.
+CANDIDATE_CAR_COUNTS = (22, 24, 20, 26)
+
+#: Trailing bytes to consider after the per-car array. Codemasters puts a
+#: handful of scalars there (suggested gear, time-trial indices, ...).
+MAX_TRAILING_BYTES = 8
+
+
+def candidate_strides(
+    payload_size: int,
+    known_stride: int,
+    min_stride: int,
+    max_stride: int,
+    counts: tuple[int, ...] = CANDIDATE_CAR_COUNTS,
+) -> list[tuple[int, int]]:
+    """(stride, car count) pairs that exactly account for `payload_size`.
+
+    A packet is `count` entries of `stride` bytes plus a few trailing
+    scalars. Given the observed size, only some (count, stride, trailing)
+    combinations are arithmetically possible - this enumerates them instead
+    of hardcoding a car count.
+
+    That matters because F1 26 grew the arrays from 22 to 24 entries. With
+    22 assumed, every derived stride is wrong, the player's slice is read
+    from the wrong offset, and every field decodes as garbage. Solving from
+    the real size also means a future title that changes this again works.
+
+    The known-good stride is offered first, but ONLY when it actually fits
+    the observed size. Offering it unconditionally was a trap: for an F1 26
+    motion packet the 2025 stride of 60 does not divide the payload at all,
+    yet it still read bytes that happened to be zero and passed a bounds
+    check. An arithmetically impossible layout is never a candidate.
+    """
+    ordered: list[tuple[int, int]] = []
+    seen: set[int] = set()
+
+    def add(stride: int, count: int) -> None:
+        if min_stride <= stride <= max_stride and stride not in seen:
+            seen.add(stride)
+            ordered.append((stride, count))
+
+    for count in counts:
+        trailing = payload_size - known_stride * count
+        if 0 <= trailing <= MAX_TRAILING_BYTES:
+            add(known_stride, count)
+            break
+
+    for count in counts:
+        for trailing in range(MAX_TRAILING_BYTES + 1):
+            usable = payload_size - trailing
+            if usable > 0 and usable % count == 0:
+                add(usable // count, count)
+    return ordered
 
 # --- header ---------------------------------------------------------------
 # 2022: format, majorVer, minorVer, packetVer, packetId, sessionUID,
@@ -163,6 +223,17 @@ def parse_header(data: bytes) -> PacketHeader | None:
 CAR_TELEMETRY = struct.Struct("<HfffBbHBBH4H4B4BH4f4B")
 CAR_TELEMETRY_SIZE = CAR_TELEMETRY.size  # 60
 
+# Split into the driving core and the tyre/thermal tail, because F1 26 uses
+# a 59-byte entry: reading the full 60-byte struct there would overrun into
+# the next car. The core - speed, pedals, gear, RPM - leads the struct and
+# has been byte-identical since 2022, so it stays trustworthy even when the
+# tail's layout is unknown. The tail is then parsed only if it validates,
+# rather than showing shifted bytes as if they were tyre temperatures.
+CAR_TELEMETRY_CORE = struct.Struct("<HfffBbHBBH")
+CAR_TELEMETRY_CORE_SIZE = CAR_TELEMETRY_CORE.size  # 18
+CAR_TELEMETRY_TAIL = struct.Struct("<4H4B4BH4f4B")
+CAR_TELEMETRY_TAIL_SIZE = CAR_TELEMETRY_TAIL.size  # 42
+
 # --- car status (id 7) ----------------------------------------------------
 # Only the leading fields are read; anything after m_maxGears is ignored.
 CAR_STATUS_PREFIX = struct.Struct("<BBBBBfffHHB")
@@ -260,3 +331,43 @@ def lap_data_stride(packet_format: int, payload_size: int) -> int:
     if derived >= 40:
         return derived
     return LAP_DATA_SIZE_2022 if packet_format <= 2022 else LAP_DATA_SIZE_2023
+
+
+# --- extended layouts (Phase 1 telemetry expansion) -----------------------
+# Full CarStatusData, not just the prefix: fuel, ERS, tyre compound and age.
+CAR_STATUS_FULL = struct.Struct("<BBBBBfffHHBBHBBBbfffBfffB")
+
+# LapData prefix through m_penalties. Parsed as a prefix because later
+# titles append fields; everything we need leads the struct.
+LAP_DATA_PREFIX = struct.Struct("<IIHBHBHHfffBBBBBBB")
+
+# PacketSessionData prefix: weather, temperatures, laps, session type.
+SESSION_PREFIX = struct.Struct("<BbbBHBbBHH")
+
+# CarDamageData: tyre wear then the component damage bytes.
+CAR_DAMAGE_FULL = struct.Struct("<4f4B4B" + "B" * 18)
+
+#: Tyre compound codes -> readable names (actual compound, not visual).
+TYRE_COMPOUNDS = {
+    16: "Soft", 17: "Medium", 18: "Hard", 7: "Inter", 8: "Wet",
+    19: "Super Soft", 20: "Soft", 21: "Medium", 22: "Hard",
+    9: "Dry", 10: "Wet", 11: "Inter", 12: "Wet",
+}
+
+WEATHER = {
+    0: "Clear", 1: "Light cloud", 2: "Overcast",
+    3: "Light rain", 4: "Heavy rain", 5: "Storm",
+}
+
+SESSION_TYPES = {
+    0: "Unknown", 1: "Practice 1", 2: "Practice 2", 3: "Practice 3",
+    4: "Short Practice", 5: "Qualifying 1", 6: "Qualifying 2",
+    7: "Qualifying 3", 8: "Short Qualifying", 9: "One-Shot Qualifying",
+    10: "Sprint Shootout 1", 11: "Sprint Shootout 2", 12: "Sprint Shootout 3",
+    13: "Short Sprint Shootout", 14: "One-Shot Sprint Shootout",
+    15: "Race", 16: "Race 2", 17: "Race 3", 18: "Time Trial",
+}
+
+ERS_MODES = {0: "None", 1: "Medium", 2: "Hotlap", 3: "Overtake"}
+#: F1 reports ERS store in joules; this is the full-charge figure.
+ERS_MAX_JOULES = 4_000_000.0

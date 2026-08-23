@@ -34,7 +34,7 @@ class GameCard(Card):
         if adapter.supported:
             self._port_spin = QSpinBox()
             self._port_spin.setRange(1024, 65535)
-            self._port_spin.setValue(page.app.settings.udp_port)
+            self._port_spin.setValue(page.app.mode_settings.udp_port)
             self._port_spin.valueChanged.connect(page.app.set_udp_port)
             self.body.addWidget(
                 FieldRow(
@@ -85,9 +85,9 @@ class GameCard(Card):
             self.body.addWidget(self._live_label)
         else:
             note = QLabel(
-                "This adapter is a placeholder. The haptic engine, effects and profiles "
-                "are game-agnostic, so implementing the telemetry reader is all that is "
-                "required - no changes to the engine."
+                "This adapter is a placeholder. The normalized telemetry model, "
+                "dashboard and analysis layers are game-agnostic, so implementing "
+                "the telemetry reader is all that is required."
             )
             note.setObjectName("Hint")
             note.setWordWrap(True)
@@ -128,9 +128,9 @@ class GameCard(Card):
         if status.detected_port and status.packets_received == 0:
             self._hint_label.setText(
                 f"Telemetry was detected on UDP port {status.detected_port}, but this "
-                f"app is listening on {self.page.app.settings.udp_port}. Either change "
+                f"app is listening on {self.page.app.mode_settings.udp_port}. Either change "
                 f"the port above to {status.detected_port}, or point the game at "
-                f"{self.page.app.settings.udp_port}."
+                f"{self.page.app.mode_settings.udp_port}."
             )
             self._hint_label.setVisible(True)
         elif status.running and status.packets_received == 0:

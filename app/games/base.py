@@ -3,11 +3,11 @@
 A game adapter owns everything game-specific: its transport (UDP, shared
 memory, whatever), its packet layouts, and the translation into the
 normalized TelemetryFrame. It hands finished frames to a callback and knows
-nothing about haptics.
+nothing about what consumes them.
 
 Adding a game means implementing this interface and registering it. The
-haptic engine, the effects and the UI require no changes - that is the
-whole point of the split.
+telemetry state, the UI and the analysis layers require no changes - that
+is the whole point of the split.
 """
 
 from __future__ import annotations
@@ -64,7 +64,14 @@ class AdapterStatus:
     connected: bool = False
     packets_received: int = 0
     packets_rejected: int = 0
+    #: Raw UDP datagrams per second. F1 sends ~7 packet types per tick, so a
+    #: healthy 60 Hz feed is ~300-600/s - a big number here is normal and is
+    #: NOT a measure of update rate. `frame_rate` is the one to judge by.
     packet_rate: float = 0.0
+    #: Normalized frames per second - one per CarTelemetry packet, so this
+    #: tracks the game's telemetry rate (60 Hz by default). This is the
+    #: number that says whether the dashboard is actually updating.
+    frame_rate: float = 0.0
     last_packet_age: float = 0.0
     detail: str = ""
     error: str = ""
@@ -82,9 +89,15 @@ class AdapterStatus:
     last_sender: str = ""
     detected_port: int = 0
     receive_buffer_kb: int = 0
+    #: True when the game is sending a packet format the selected
+    #: game mode did not expect. Advisory - parsing still works.
+    format_mismatch: bool = False
+    #: The format the game is actually sending, as a number (0 = unknown).
+    #: Kept separate from `detail`, which is display text.
+    packet_format: int = 0
     #: Live values straight from the last normalized frame. Deliberately
-    #: independent of the haptic engine so the UI can prove telemetry is
-    #: arriving even when the engine is stopped or output is muted.
+    #: independent of any consumer so the UI can prove telemetry is
+    #: arriving regardless of what is downstream.
     live_rpm: float = 0.0
     live_max_rpm: float = 0.0
     live_speed_kph: float = 0.0

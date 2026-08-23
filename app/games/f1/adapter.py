@@ -4,18 +4,12 @@ Telemetry arrives split across several packet types at different rates, so
 this class keeps a running picture of the car and emits a complete frame
 whenever the car-telemetry packet lands (the fastest and most useful one).
 
-Collision handling deserves a note. The F1 UDP spec has no collision event,
-so contact is *derived* rather than read:
-
-  * primary signal - a large single-frame jump in combined lateral and
-    longitudinal g. Hard braking builds g over many frames; hitting a wall
-    changes it violently in one, so jerk separates the two cleanly.
-  * confirmation - an increase in wing or floor damage. This packet is slow
-    (a few Hz) so it cannot be the trigger, but it reliably raises
-    confidence that real contact happened.
-
-Vertical g is deliberately excluded: kerbs and crests spike it constantly
-and they already have their own effects.
+Contact detection deserves a note. The F1 UDP spec has no collision event,
+so contact is *derived* rather than read: a large single-frame jump in
+combined lateral and longitudinal g, confirmed by an increase in wing or
+floor damage. Vertical g is excluded because kerbs and crests spike it
+constantly. The result is exposed as `impact` and clearly labelled as
+derived rather than measured.
 """
 
 from __future__ import annotations
@@ -27,7 +21,7 @@ import time
 
 from app.core.logging import RateLimitedLogger, get_logger
 from app.core.models import Surfaces, TelemetryFrame, Wheels
-from app.games.base import AdapterStatus, GameAdapter, TelemetryStage
+from app.games.base import AdapterStatus, GameAdapter, RateTracker, TelemetryStage
 from app.games.f1 import packets as p
 from app.games.f1 import parser
 from app.games.f1.telemetry import DEFAULT_PORT, TelemetryListener
@@ -78,6 +72,10 @@ class F1Adapter(GameAdapter):
         self.listener.set_callback(self._on_packet)
 
         self._lock = threading.Lock()
+        # Frames/s, tracked separately from packets/s. The two differ by
+        # roughly 7x because F1 sends several packet types per tick, and
+        # conflating them makes a healthy feed look alarming.
+        self._frame_rate = RateTracker()
         self._reset_state()
 
         self._packets_rejected = 0
@@ -85,6 +83,14 @@ class F1Adapter(GameAdapter):
         self._frames_emitted = 0
         self._packets_parsed = 0
         self._warned_format = False
+        self._expected_formats: tuple[int, ...] = ()
+        self._warned_mismatch = False
+        #: Optional observer called for every raw packet, before parsing.
+        #: Used by the recorder and inspector; never affects decoding.
+        self._packet_observer = None
+        #: Packets fed from a replay rather than the socket.
+        self._replay_packets = 0
+        self._replay_active = False
         self._packet_counts: dict[int, int] = {}
 
     # ------------------------------------------------------------------
@@ -97,6 +103,30 @@ class F1Adapter(GameAdapter):
         timeout = options.get("connection_timeout")
         if timeout is not None:
             self.listener.connection_timeout = float(timeout)
+        formats = options.get("expected_formats")
+        if formats is not None:
+            # Advisory only. The parser stays range-tolerant, so a surprise
+            # version still works - this just lets the UI say "you selected
+            # F1 26 but the game is sending 2025".
+            self._expected_formats = tuple(int(f) for f in formats)
+            self._warned_mismatch = False
+
+    def set_packet_observer(self, observer) -> None:
+        """Register a callback for raw packets. Observers must not raise."""
+        self._packet_observer = observer
+
+    def feed(self, data: bytes) -> None:
+        """Inject a packet from a replay.
+
+        Goes through the identical path as a live packet, which is what
+        makes replay a faithful reproduction rather than a simulation.
+        """
+        self._replay_active = True
+        self._replay_packets += 1
+        self._on_packet(data)
+
+    def end_replay(self) -> None:
+        self._replay_active = False
 
     def start(self) -> None:
         self._reset_state()
@@ -121,18 +151,25 @@ class F1Adapter(GameAdapter):
             packets_received=self.listener.packets_received,
             packets_rejected=self._packets_rejected,
             packet_rate=self.listener.packet_rate,
+            frame_rate=self._frame_rate.rate(),
             last_packet_age=0.0 if math.isinf(age) else age,
             detail=detail,
             error=self.listener.error,
             stage=self._stage(),
             bytes_per_sec=self.listener.bytes_per_sec,
-            raw_packets=self.listener.raw_packets,
+            raw_packets=self.listener.raw_packets + self._replay_packets,
             packets_parsed=self._packets_parsed,
             frames_emitted=self._frames_emitted,
             packet_types=self._packet_type_summary(),
             last_sender=self.listener.last_sender,
             detected_port=self.listener.detected_port,
             receive_buffer_kb=self.listener.receive_buffer_size // 1024,
+            format_mismatch=bool(
+                self._expected_formats
+                and self._packet_format
+                and self._packet_format not in self._expected_formats
+            ),
+            packet_format=self._packet_format,
             **self._live_values(),
             **self._raw_values(),
         )
@@ -140,9 +177,8 @@ class F1Adapter(GameAdapter):
     def _live_values(self) -> dict[str, float | int]:
         """The most recent normalized frame, for display.
 
-        Read straight from the adapter rather than from the engine, so the
-        UI can show real changing telemetry even if the haptic engine is
-        stopped, muted, or the emergency stop is latched.
+        Read straight from the adapter, so the UI can show real changing
+        telemetry independently of anything downstream.
         """
         with self._lock:
             frame = self._last_frame
@@ -192,15 +228,15 @@ class F1Adapter(GameAdapter):
         """
         if self.listener.error:
             return TelemetryStage.ERROR
-        if not self.listener.running:
+        if not self.listener.running and not self._replay_active:
             return TelemetryStage.WAITING
-        if self.listener.raw_packets == 0:
+        if self.listener.raw_packets + self._replay_packets == 0:
             return TelemetryStage.SOCKET_BOUND
         if self._packets_parsed == 0:
             return TelemetryStage.PACKETS_RECEIVED
         if self._frames_emitted == 0:
             return TelemetryStage.PACKETS_PARSED
-        if not self.listener.connected:
+        if not self.listener.connected and not self._replay_active:
             return TelemetryStage.TELEMETRY_VALID
         return TelemetryStage.TELEMETRY_LIVE
 
@@ -217,12 +253,19 @@ class F1Adapter(GameAdapter):
         return self.listener.port
 
     def _reset_state(self) -> None:
+        self._frame_rate.reset()
+        # Strides are learned per session: a different game, mode or session
+        # may use a different array size, so never carry them across.
+        parser.reset_stride_cache()
         with self._lock:
             self._telemetry: parser.CarTelemetry | None = None
             self._status: parser.CarStatus | None = None
             self._motion: parser.MotionData | None = None
             self._motion_ex: parser.MotionExtended | None = None
             self._pit_status = 0
+            self._lap: parser.LapData | None = None
+            self._session: parser.SessionData | None = None
+            self._damage: parser.DamageData | None = None
             self._damage_total: int | None = None
             self._prev_g_lat = 0.0
             self._prev_g_lon = 0.0
@@ -233,16 +276,25 @@ class F1Adapter(GameAdapter):
             self._warned_format = False
             self._packet_counts = {}
             self._last_frame = None
+            self._replay_packets = 0
             self._player_index = 0
             self._prev_gear = 0
             self._current_gear = 0
             self._last_shift = "none"
             self._shift_count = 0
+            self._best_lap = 0.0
 
     # ------------------------------------------------------------------
     # packet handling
     # ------------------------------------------------------------------
     def _on_packet(self, data: bytes) -> None:
+        observer = self._packet_observer
+        if observer is not None:
+            try:
+                observer(data)
+            except Exception:  # noqa: BLE001 - observers never break telemetry
+                _rate_log.error("observer", "Packet observer failed")
+
         header = p.parse_header(data)
         if header is None:
             self._packets_rejected += 1
@@ -275,6 +327,18 @@ class F1Adapter(GameAdapter):
 
         self._packet_format = header.packet_format
         self._player_index = header.player_car_index
+        if (
+            self._expected_formats
+            and header.packet_format not in self._expected_formats
+            and not self._warned_mismatch
+        ):
+            self._warned_mismatch = True
+            _log.warning(
+                "Game mode expects packet format %s but the game is sending "
+                "%d. Telemetry still parses; check the selected game mode.",
+                "/".join(str(f) for f in self._expected_formats),
+                header.packet_format,
+            )
 
         packet_id = header.packet_id
         with self._lock:
@@ -283,19 +347,22 @@ class F1Adapter(GameAdapter):
         if packet_id == p.PACKET_CAR_TELEMETRY:
             self._handle_car_telemetry(data, header)
         elif packet_id == p.PACKET_CAR_STATUS:
-            self._store("_status", parser.parse_car_status(data, header))
+            self._store("_status", parser.parse_car_status_full(data, header))
         elif packet_id == p.PACKET_MOTION:
             self._handle_motion(data, header)
         elif packet_id == p.PACKET_MOTION_EX:
             self._store("_motion_ex", parser.parse_motion_extended(data, header))
         elif packet_id == p.PACKET_LAP_DATA:
-            pit = parser.parse_pit_status(data, header)
-            if pit is not None:
+            lap = parser.parse_lap_data(data, header)
+            if lap is not None:
                 with self._lock:
-                    self._pit_status = pit
+                    self._lap = lap
+                    self._pit_status = lap.pit_status
+        elif packet_id == p.PACKET_SESSION:
+            self._store("_session", parser.parse_session(data, header))
         elif packet_id == p.PACKET_CAR_DAMAGE:
             self._handle_damage(data, header)
-        # Other packet ids carry no haptic value and are ignored by design.
+        # Remaining packet ids are not consumed yet and are ignored.
 
     def _store(self, attribute: str, value) -> None:
         if value is None:
@@ -331,6 +398,10 @@ class F1Adapter(GameAdapter):
             self._store("_motion_ex", parser.parse_motion_extended(data, header))
 
     def _handle_damage(self, data: bytes, header: p.PacketHeader) -> None:
+        detail = parser.parse_car_damage_full(data, header)
+        if detail is not None:
+            with self._lock:
+                self._damage = detail
         damage = parser.parse_car_damage(data, header)
         if damage is None:
             self._packets_rejected += 1
@@ -373,6 +444,7 @@ class F1Adapter(GameAdapter):
             self._frames_emitted += 1
             self._last_frame = frame
 
+        self._frame_rate.mark()
         self._emit(frame)
 
     def _build_frame(self) -> TelemetryFrame:
@@ -381,6 +453,14 @@ class F1Adapter(GameAdapter):
         status = self._status
         motion = self._motion
         motion_ex = self._motion_ex
+        lap = self._lap
+        session = self._session
+        damage = self._damage
+
+        # Best lap is tracked here because F1 reports only the last lap.
+        if lap and lap.last_lap_time_s > 0:
+            if self._best_lap <= 0 or lap.last_lap_time_s < self._best_lap:
+                self._best_lap = lap.last_lap_time_s
 
         assert telemetry is not None  # only called from _handle_car_telemetry
 
@@ -436,4 +516,52 @@ class F1Adapter(GameAdapter):
                 and telemetry.throttle > 0.5
             ),
             impact=self._pending_impact,
+            # --- tyres ---
+            tyre_surface_temp=telemetry.tyre_surface_temp,
+            tyre_inner_temp=telemetry.tyre_inner_temp,
+            tyre_pressure=telemetry.tyre_pressure,
+            brake_temp=telemetry.brake_temp,
+            tyre_wear=damage.tyre_wear if damage else Wheels(),
+            tyre_compound=status.tyre_compound if status else "",
+            tyre_age_laps=status.tyre_age_laps if status else -1,
+            # --- lap / position ---
+            position=lap.position if lap else 0,
+            current_lap=lap.current_lap if lap else 0,
+            total_laps=session.total_laps if session else 0,
+            last_lap_time_s=lap.last_lap_time_s if lap else 0.0,
+            current_lap_time_s=lap.current_lap_time_s if lap else 0.0,
+            best_lap_time_s=self._best_lap,
+            sector=lap.sector if lap else 0,
+            sector1_time_s=lap.sector1_time_s if lap else 0.0,
+            sector2_time_s=lap.sector2_time_s if lap else 0.0,
+            lap_distance_m=lap.lap_distance_m if lap else 0.0,
+            delta_to_car_ahead_s=lap.delta_to_car_ahead_s if lap else 0.0,
+            delta_to_leader_s=lap.delta_to_leader_s if lap else 0.0,
+            lap_invalid=lap.lap_invalid if lap else False,
+            penalties_s=lap.penalties_s if lap else 0,
+            # --- fuel / ERS ---
+            fuel_in_tank=status.fuel_in_tank if status else 0.0,
+            fuel_capacity=status.fuel_capacity if status else 0.0,
+            fuel_remaining_laps=status.fuel_remaining_laps if status else 0.0,
+            ers_store_percent=(
+                100.0 * status.ers_store_joules / p.ERS_MAX_JOULES if status else 0.0
+            ),
+            ers_mode=status.ers_mode if status else "",
+            ers_deployed_lap=status.ers_deployed_lap if status else 0.0,
+            ers_harvested_lap=status.ers_harvested_lap if status else 0.0,
+            # --- session / conditions ---
+            session_type=session.session_type if session else "",
+            weather=session.weather if session else "",
+            air_temperature=session.air_temperature if session else 0.0,
+            track_temperature=session.track_temperature if session else 0.0,
+            session_time_left_s=session.session_time_left_s if session else 0.0,
+            # --- damage ---
+            front_left_wing_damage=damage.front_left_wing if damage else 0,
+            front_right_wing_damage=damage.front_right_wing if damage else 0,
+            rear_wing_damage=damage.rear_wing if damage else 0,
+            floor_damage=damage.floor if damage else 0,
+            diffuser_damage=damage.diffuser if damage else 0,
+            sidepod_damage=damage.sidepod if damage else 0,
+            gearbox_damage=damage.gearbox if damage else 0,
+            engine_damage=damage.engine if damage else 0,
         )

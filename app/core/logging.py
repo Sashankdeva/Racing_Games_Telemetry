@@ -98,7 +98,7 @@ def setup_logging(verbose: bool = False, to_file: bool = True) -> None:
         try:
             ensure_dirs()
             file_handler = logging.handlers.RotatingFileHandler(
-                logs_dir() / "racing_haptic_engine.log",
+                logs_dir() / "f1_race_engineer.log",
                 maxBytes=1_000_000,
                 backupCount=3,
                 encoding="utf-8",

@@ -1,28 +1,17 @@
-"""Live visualisation: motor meters, the haptic scope, and an RPM bar.
+"""Live telemetry visualisation.
 
-These are the widgets that have to be readable at a glance while racing, so
-they favour large shapes and colour transitions over numbers. All of them
-are fed by polling an EngineSnapshot - none subscribe to the haptic thread.
+Widgets that must be readable at a glance while racing, so they favour
+large shapes and colour transitions over numbers. All are fed by polling a
+telemetry snapshot - none subscribe to the telemetry thread.
 """
 
 from __future__ import annotations
 
-from collections import deque
-
-from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from app.ui import theme
-
-
-def _intensity_colour(value: float) -> QColor:
-    """Teal -> amber -> red as intensity climbs."""
-    if value <= 0.5:
-        t = value / 0.5
-        return _blend(QColor(theme.METER_LOW), QColor(theme.METER_MID), t)
-    t = (value - 0.5) / 0.5
-    return _blend(QColor(theme.METER_MID), QColor(theme.METER_HIGH), t)
 
 
 def _blend(a: QColor, b: QColor, t: float) -> QColor:
@@ -32,170 +21,6 @@ def _blend(a: QColor, b: QColor, t: float) -> QColor:
         int(a.green() + (b.green() - a.green()) * t),
         int(a.blue() + (b.blue() - a.blue()) * t),
     )
-
-
-class MotorMeter(QWidget):
-    """Horizontal bar for one motor, with a decaying peak marker.
-
-    The peak marker matters: raw output changes far faster than the eye can
-    track, so without it a strong 30 ms transient would flash past unseen.
-    """
-
-    PEAK_DECAY = 0.9
-
-    def __init__(self, label: str = "LEFT", parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._label = label
-        self._value = 0.0
-        self._peak = 0.0
-        self.setMinimumHeight(38)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-    def set_value(self, value: float) -> None:
-        self._value = max(0.0, min(1.0, value))
-        self._peak = max(self._value, self._peak * self.PEAK_DECAY)
-        if self._peak < 0.001:
-            self._peak = 0.0
-        self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        width = self.width()
-        bar_top = 16
-        bar_height = self.height() - bar_top
-        radius = bar_height / 2
-
-        painter.setPen(QColor(theme.TEXT_FAINT))
-        font = painter.font()
-        font.setPointSize(8)
-        font.setBold(True)
-        painter.setFont(font)
-        # Wide enough for the longest label ("RIGHT MOTOR") without clipping.
-        painter.drawText(
-            0, 0, width - 60, 12,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            self._label,
-        )
-        painter.drawText(
-            width - 60, 0, 60, 12,
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-            f"{self._value * 100:.0f}%",
-        )
-
-        track = QRectF(0, bar_top, width, bar_height)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(theme.SURFACE_ALT))
-        painter.drawRoundedRect(track, radius, radius)
-
-        if self._value > 0.001:
-            fill_width = max(bar_height, width * self._value)
-            fill = QRectF(0, bar_top, fill_width, bar_height)
-            gradient = QLinearGradient(0, 0, fill_width, 0)
-            gradient.setColorAt(0.0, QColor(theme.METER_LOW))
-            gradient.setColorAt(0.55, QColor(theme.METER_MID))
-            gradient.setColorAt(1.0, _intensity_colour(self._value))
-            painter.setBrush(gradient)
-            painter.drawRoundedRect(fill, radius, radius)
-
-        if self._peak > 0.01:
-            x = max(bar_height, width * self._peak)
-            pen = QPen(QColor(theme.TEXT), 2)
-            painter.setPen(pen)
-            painter.drawLine(QPointF(x - 1, bar_top + 2), QPointF(x - 1, bar_top + bar_height - 2))
-
-
-class HapticScope(QWidget):
-    """Scrolling history of both motors - the live haptic visualisation.
-
-    Shows shape over time, which is what actually distinguishes effects: a
-    gear shift spike, the sawtooth of kerbs and the dense band of high-rev
-    engine all look different here even when their peak levels match.
-    """
-
-    def __init__(self, history: int = 220, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._left: deque[float] = deque([0.0] * history, maxlen=history)
-        self._right: deque[float] = deque([0.0] * history, maxlen=history)
-        self.setMinimumHeight(120)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-    def push(self, left: float, right: float) -> None:
-        self._left.append(max(0.0, min(1.0, left)))
-        self._right.append(max(0.0, min(1.0, right)))
-        self.update()
-
-    def clear(self) -> None:
-        for buffer in (self._left, self._right):
-            for _ in range(len(buffer)):
-                buffer.append(0.0)
-        self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        rect = self.rect().adjusted(0, 0, -1, -1)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(theme.BG))
-        painter.drawRoundedRect(rect, 8, 8)
-
-        # Reference gridlines at 25/50/75%.
-        grid = QPen(QColor(theme.BORDER), 1, Qt.PenStyle.DashLine)
-        painter.setPen(grid)
-        for fraction in (0.25, 0.5, 0.75):
-            y = rect.bottom() - rect.height() * fraction
-            painter.drawLine(rect.left() + 6, int(y), rect.right() - 6, int(y))
-
-        self._draw_trace(painter, rect, self._left, QColor(theme.METER_LOW))
-        self._draw_trace(painter, rect, self._right, QColor(theme.ACCENT))
-
-        painter.setPen(QColor(theme.TEXT_FAINT))
-        font = painter.font()
-        font.setPointSize(8)
-        font.setBold(True)
-        painter.setFont(font)
-        painter.drawText(rect.adjusted(10, 6, -10, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, "LEFT")
-        painter.setPen(QColor(theme.ACCENT))
-        painter.drawText(rect.adjusted(10, 6, -10, 0), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop, "RIGHT")
-
-    def _draw_trace(self, painter: QPainter, rect, samples: deque[float], colour: QColor) -> None:
-        if not samples:
-            return
-
-        count = len(samples)
-        left = rect.left() + 6
-        usable_width = rect.width() - 12
-        bottom = rect.bottom() - 6
-        usable_height = rect.height() - 24
-        step = usable_width / max(1, count - 1)
-
-        path = QPainterPath()
-        fill = QPainterPath()
-        fill.moveTo(left, bottom)
-
-        for index, value in enumerate(samples):
-            x = left + index * step
-            y = bottom - value * usable_height
-            if index == 0:
-                path.moveTo(x, y)
-            else:
-                path.lineTo(x, y)
-            fill.lineTo(x, y)
-
-        fill.lineTo(left + (count - 1) * step, bottom)
-        fill.closeSubpath()
-
-        shade = QColor(colour)
-        shade.setAlpha(38)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(shade)
-        painter.drawPath(fill)
-
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(colour, 1.6))
-        painter.drawPath(path)
 
 
 class RpmBar(QWidget):
@@ -220,8 +45,7 @@ class RpmBar(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         gap = 3
-        total = self.width()
-        segment_width = (total - gap * (self.SEGMENTS - 1)) / self.SEGMENTS
+        segment_width = (self.width() - gap * (self.SEGMENTS - 1)) / self.SEGMENTS
         lit = int(self._ratio * self.SEGMENTS + 0.5)
 
         for index in range(self.SEGMENTS):
@@ -243,24 +67,264 @@ class RpmBar(QWidget):
             painter.drawRoundedRect(QRectF(x, 0, segment_width, self.height()), 2, 2)
 
 
-class ActivityDot(QWidget):
-    """Compact pulse indicator used in the sidebar footer."""
+class InputBar(QWidget):
+    """Horizontal bar for a driver input (throttle / brake / steering).
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    `bipolar` centres the fill for steering, which swings both ways - a
+    left-anchored bar would wrongly imply that full-left is "zero".
+    """
+
+    def __init__(
+        self,
+        label: str,
+        colour: str,
+        bipolar: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
-        self._level = 0.0
-        self.setFixedSize(10, 10)
+        self._label = label
+        self._colour = QColor(colour)
+        self._bipolar = bipolar
+        self._value = 0.0
+        self.setMinimumHeight(34)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-    def set_level(self, level: float) -> None:
-        level = max(0.0, min(1.0, level))
-        if abs(level - self._level) > 0.01:
-            self._level = level
-            self.update()
+    def set_value(self, value: float) -> None:
+        low = -1.0 if self._bipolar else 0.0
+        self._value = max(low, min(1.0, value))
+        self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        colour = _intensity_colour(self._level) if self._level > 0.01 else QColor(theme.IDLE)
+
+        width, top = self.width(), 14
+        height = self.height() - top
+        radius = height / 2
+
+        painter.setPen(QColor(theme.TEXT_FAINT))
+        font = painter.font()
+        font.setPointSize(8)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(
+            0, 0, width - 60, 11,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._label,
+        )
+        readout = f"{self._value:+.2f}" if self._bipolar else f"{self._value * 100:.0f}%"
+        painter.drawText(
+            width - 60, 0, 60, 11,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, readout,
+        )
+
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(colour)
-        painter.drawEllipse(self.rect())
+        painter.setBrush(QColor(theme.SURFACE_ALT))
+        painter.drawRoundedRect(QRectF(0, top, width, height), radius, radius)
+
+        if abs(self._value) < 0.005:
+            return
+
+        painter.setBrush(self._colour)
+        if self._bipolar:
+            centre = width / 2
+            span = (width / 2) * self._value
+            x = centre if span >= 0 else centre + span
+            painter.drawRoundedRect(QRectF(x, top, abs(span), height), radius, radius)
+        else:
+            painter.drawRoundedRect(
+                QRectF(0, top, max(height, width * self._value), height), radius, radius
+            )
+
+
+class TyreGrid(QWidget):
+    """Four-corner tyre readout: surface temperature, pressure and wear."""
+
+    #: Surface temperature window, used only for colouring.
+    COLD_C = 80.0
+    HOT_C = 110.0
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._temp = None
+        self._pressure = None
+        self._wear = None
+        self.setMinimumHeight(124)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_values(self, temp, pressure, wear) -> None:
+        self._temp, self._pressure, self._wear = temp, pressure, wear
+        self.update()
+
+    def clear(self) -> None:
+        self._temp = self._pressure = self._wear = None
+        self.update()
+
+    def _temp_colour(self, celsius: float) -> QColor:
+        if celsius <= 0:
+            return QColor(theme.IDLE)
+        if celsius < self.COLD_C:
+            return _blend(
+                QColor(theme.LIVE), QColor(theme.METER_MID), celsius / max(1.0, self.COLD_C)
+            )
+        span = max(1.0, self.HOT_C - self.COLD_C)
+        return _blend(
+            QColor(theme.METER_MID), QColor(theme.DANGER), (celsius - self.COLD_C) / span
+        )
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        cell_w = self.width() / 2 - 6
+        cell_h = self.height() / 2 - 6
+
+        values = None
+        if self._temp is not None:
+            values = {
+                "FL": (self._temp.fl, self._pressure.fl, self._wear.fl),
+                "FR": (self._temp.fr, self._pressure.fr, self._wear.fr),
+                "RL": (self._temp.rl, self._pressure.rl, self._wear.rl),
+                "RR": (self._temp.rr, self._pressure.rr, self._wear.rr),
+            }
+
+        font = painter.font()
+        for name, col, row in (("FL", 0, 0), ("FR", 1, 0), ("RL", 0, 1), ("RR", 1, 1)):
+            x = col * (cell_w + 12)
+            y = row * (cell_h + 12)
+            rect = QRectF(x, y, cell_w, cell_h)
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(theme.SURFACE_ALT))
+            painter.drawRoundedRect(rect, 6, 6)
+
+            temp = values[name][0] if values else 0.0
+            if values:
+                painter.setBrush(self._temp_colour(temp))
+                painter.drawRoundedRect(QRectF(x, y + cell_h - 4, cell_w, 4), 2, 2)
+
+            painter.setPen(QColor(theme.TEXT_FAINT))
+            font.setPointSize(8)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(
+                rect.adjusted(8, 5, -8, 0),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, name,
+            )
+
+            painter.setPen(QColor(theme.TEXT))
+            font.setPointSize(11)
+            painter.setFont(font)
+            painter.drawText(
+                rect.adjusted(8, 2, -8, -6),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                f"{temp:.0f} C" if values else "-",
+            )
+
+            if values:
+                _, pressure, wear = values[name]
+                painter.setPen(QColor(theme.TEXT_DIM))
+                font.setPointSize(8)
+                font.setBold(False)
+                painter.setFont(font)
+                painter.drawText(
+                    rect.adjusted(8, 0, -8, -8),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom,
+                    f"{pressure:.1f} psi   wear {wear:.0f}%",
+                )
+
+
+class BatteryMeter(QWidget):
+    """ERS store as a segmented battery, coloured by deploy mode.
+
+    Two visual modes, because the same charge level means different things
+    depending on what the car is doing with it:
+
+      * NORMAL    - charge shown in the standard live colour
+      * OVERTAKE  - the whole meter switches to the attack colour, so a
+                    glance tells the driver energy is being spent hard
+                    rather than managed
+
+    Charge level is telemetry; the mode is telemetry. Neither is inferred.
+    An empty mode string (game not reporting it) renders as normal, never
+    as overtake.
+    """
+
+    SEGMENTS = 12
+    #: Deploy mode that switches the meter to attack colours. Matched
+    #: case-insensitively because the label comes from the game.
+    OVERTAKE_MODE = "overtake"
+    #: Below this fraction the meter warns regardless of mode - out of
+    #: energy is worth noticing whatever the deploy setting says.
+    LOW_CHARGE = 0.15
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._ratio = 0.0
+        self._mode = ""
+        self._available = False
+        self.setMinimumHeight(22)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_state(self, percent: float, mode: str, available: bool = True) -> None:
+        ratio = max(0.0, min(1.0, percent / 100.0))
+        mode = mode or ""
+        if (
+            abs(ratio - self._ratio) > 0.002
+            or mode != self._mode
+            or available != self._available
+        ):
+            self._ratio = ratio
+            self._mode = mode
+            self._available = available
+            self.update()
+
+    def clear(self) -> None:
+        self.set_state(0.0, "", available=False)
+
+    @property
+    def overtaking(self) -> bool:
+        return self._mode.strip().lower() == self.OVERTAKE_MODE
+
+    def charge_colour(self) -> QColor:
+        """The colour the lit segments are drawn in."""
+        if not self._available:
+            return QColor(theme.SURFACE_ALT)
+        if self.overtaking:
+            return QColor(theme.ACCENT)
+        if self._ratio <= self.LOW_CHARGE:
+            return QColor(theme.WARN)
+        return QColor(theme.LIVE)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        gap = 3
+        # Leave room for the battery "terminal" on the right so the shape
+        # reads as a battery rather than another progress bar.
+        terminal = 5
+        body_width = self.width() - terminal - 4
+        segment_width = (body_width - gap * (self.SEGMENTS - 1)) / self.SEGMENTS
+        lit = int(self._ratio * self.SEGMENTS + 0.5)
+        colour = self.charge_colour()
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        for index in range(self.SEGMENTS):
+            x = index * (segment_width + gap)
+            painter.setBrush(colour if index < lit else QColor(theme.SURFACE_ALT))
+            painter.drawRoundedRect(
+                QRectF(x, 0, segment_width, self.height()), 2, 2
+            )
+
+        terminal_colour = QColor(colour if self._available else theme.SURFACE_ALT)
+        painter.setBrush(terminal_colour)
+        painter.drawRoundedRect(
+            QRectF(
+                body_width + 4,
+                self.height() * 0.28,
+                terminal,
+                self.height() * 0.44,
+            ),
+            1.5,
+            1.5,
+        )

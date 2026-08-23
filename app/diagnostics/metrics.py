@@ -1,85 +1,72 @@
-"""Collects a single consistent view of system health for the UI.
+"""Collects one consistent view of telemetry health for the UI.
 
-Pulls from the controller, engine and adapter on demand rather than having
-those components push status around. The Diagnostics page polls this a few
-times a second; nothing here runs in the haptic hot path.
+Pulls from the adapter and the telemetry state on demand rather than
+having them push status around. The Diagnostics page polls this a few
+times a second.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from app.controller import xinput
-from app.controller.blitz import XInputController
+from app.core.telemetry_state import (
+    TelemetrySnapshot,
+    TelemetryState,
+    TelemetryStatus,
+)
 from app.games.base import AdapterStatus, GameAdapter
-from app.haptics.engine import EngineSnapshot, HapticEngine
+from app.core.models import NO_TELEMETRY, TelemetryFrame
 
 
 @dataclass(frozen=True, slots=True)
 class DiagnosticsReport:
-    # controller
-    xinput_available: bool = False
-    xinput_dll: str = ""
-    xinput_error: str = ""
-    controller_connected: bool = False
-    controller_index: int = 0
-    controller_name: str = ""
-    connected_indices: tuple[int, ...] = ()
-    rumble_writes_ok: int = 0
-    rumble_writes_failed: int = 0
-    last_result_code: int = 0
-
-    # telemetry
     adapter: AdapterStatus | None = None
-
-    # haptics
-    engine: EngineSnapshot = field(default_factory=EngineSnapshot)
-    target_tick_rate: float = 0.0
-    scheduled_cues: int = 0
+    telemetry: TelemetrySnapshot | None = None
 
     @property
-    def rumble_ok(self) -> bool:
-        """True once at least one write has succeeded and none are failing."""
-        return self.rumble_writes_ok > 0 and self.last_result_code == 0
+    def frame(self) -> TelemetryFrame:
+        """The last valid frame, whether or not it is current.
+
+        Stale is not empty: when the game pauses or drops packets the car
+        is still on the same lap and the same tyres. Consumers pair this
+        with `status` rather than being handed a blank frame.
+        """
+        return self.telemetry.frame if self.telemetry else NO_TELEMETRY
 
     @property
-    def tick_rate_healthy(self) -> bool:
-        if not self.engine.running or self.target_tick_rate <= 0:
-            return False
-        return self.engine.tick_rate >= self.target_tick_rate * 0.8
+    def status(self) -> TelemetryStatus:
+        return self.telemetry.status if self.telemetry else TelemetryStatus.NO_DATA
+
+    @property
+    def live(self) -> bool:
+        return bool(self.telemetry and self.telemetry.live)
+
+    @property
+    def stale(self) -> bool:
+        return bool(self.telemetry and self.telemetry.stale)
+
+    @property
+    def has_data(self) -> bool:
+        """True once anything valid has arrived this session."""
+        return bool(self.telemetry and self.telemetry.has_data)
+
+    @property
+    def age(self) -> float:
+        return self.telemetry.age if self.telemetry else 0.0
 
 
 class DiagnosticsCollector:
     def __init__(
-        self,
-        controller: XInputController,
-        engine: HapticEngine,
-        adapter: GameAdapter | None = None,
+        self, telemetry: TelemetryState, adapter: GameAdapter | None = None
     ) -> None:
-        self.controller = controller
-        self.engine = engine
+        self.telemetry = telemetry
         self.adapter = adapter
 
     def set_adapter(self, adapter: GameAdapter | None) -> None:
         self.adapter = adapter
 
     def collect(self) -> DiagnosticsReport:
-        info = self.controller.info()
-        writes_ok, writes_failed = self.controller.write_stats
-
         return DiagnosticsReport(
-            xinput_available=xinput.available(),
-            xinput_dll=xinput.dll_name(),
-            xinput_error=xinput.load_error(),
-            controller_connected=info.connected,
-            controller_index=info.index,
-            controller_name=info.name,
-            connected_indices=tuple(xinput.connected_indices()),
-            rumble_writes_ok=writes_ok,
-            rumble_writes_failed=writes_failed,
-            last_result_code=self.controller.last_result_code,
             adapter=self.adapter.status() if self.adapter else None,
-            engine=self.engine.snapshot(),
-            target_tick_rate=self.engine.tick_rate,
-            scheduled_cues=self.engine.scheduler.active_count,
+            telemetry=self.telemetry.snapshot(),
         )

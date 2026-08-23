@@ -297,6 +297,10 @@ class StatBlock(QWidget):
         if self._value.text() != value:
             self._value.setText(value)
 
+    def set_label(self, label: str) -> None:
+        """Captions can be game-specific (DRS vs Manual Override)."""
+        self._label.setText(label.upper())
+
 
 class FieldRow(QWidget):
     """Label on the left, control on the right - the standard settings row."""

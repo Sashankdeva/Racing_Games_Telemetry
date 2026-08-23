@@ -1,10 +1,10 @@
 """Minimal thread-safe publish/subscribe bus.
 
-Used for discrete, low-frequency facts ("controller disconnected",
-"telemetry lost") that must cross thread boundaries. High-frequency data
-(motor levels, telemetry frames) is NOT pushed through here - the UI polls
-an immutable snapshot instead, which avoids flooding the event system and
-keeps the Qt thread out of the haptic hot path.
+Used for discrete, low-frequency facts ("telemetry lost", "session
+started") that must cross thread boundaries. High-frequency data
+(telemetry frames) is NOT pushed through here - consumers poll an
+immutable snapshot instead, which avoids flooding the event system and
+keeps the Qt thread off the receive path.
 """
 
 from __future__ import annotations
@@ -16,20 +16,19 @@ from typing import Any, Callable
 
 
 class Event(str, Enum):
-    CONTROLLER_CONNECTED = "controller.connected"
-    CONTROLLER_DISCONNECTED = "controller.disconnected"
-    CONTROLLER_ERROR = "controller.error"
-
     TELEMETRY_CONNECTED = "telemetry.connected"
     TELEMETRY_LOST = "telemetry.lost"
     TELEMETRY_ERROR = "telemetry.error"
 
-    PROFILE_CHANGED = "profile.changed"
-    PROFILE_SAVED = "profile.saved"
+    MODE_CHANGED = "mode.changed"
 
-    EMERGENCY_STOP = "safety.emergency_stop"
-    EMERGENCY_STOP_CLEARED = "safety.emergency_stop_cleared"
-    SAFETY_CUTOFF = "safety.cutoff"
+    SESSION_STARTED = "session.started"
+    SESSION_ENDED = "session.ended"
+
+    #: A lap finished and the analysis was refreshed. Carries the LapRecord.
+    #: Emitted from the telemetry thread, so handlers must be cheap and must
+    #: not touch Qt widgets directly.
+    LAP_COMPLETED = "lap.completed"
 
 
 Handler = Callable[..., None]
@@ -51,7 +50,7 @@ class EventBus:
 
     def emit(self, event: Event, **payload: Any) -> None:
         """Notify subscribers. A failing handler never breaks the emitter -
-        this is called from the haptic and telemetry threads."""
+        this is called from the telemetry thread."""
         with self._lock:
             handlers = list(self._handlers[event])
         for handler in handlers:

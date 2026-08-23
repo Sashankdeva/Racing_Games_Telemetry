@@ -20,7 +20,9 @@ Design decisions that matter for reliability:
     than taking one datagram per poll, so a burst is consumed in one pass.
   * Optional port auto-detection: if the configured port stays silent, a
     background scan watches the other ports F1 commonly uses and reports
-    where the game is actually sending.
+    where the game is actually sending. It only ever runs while the real
+    port is silent, and releases every socket the moment telemetry arrives
+    - see _PortScanner for why that matters.
 """
 
 from __future__ import annotations
@@ -185,7 +187,9 @@ class TelemetryListener:
 
         if self.auto_detect_port:
             self._scanner = _PortScanner(
-                exclude=self.port, on_found=self._on_port_detected
+                exclude=self.port,
+                on_found=self._on_port_detected,
+                is_needed=lambda: self._packets == 0,
             )
             self._scanner.start()
         return True
@@ -318,17 +322,42 @@ class TelemetryListener:
 
 
 class _PortScanner:
-    """Watches the other ports F1 commonly uses.
+    """Watches the other ports F1 commonly uses, but only while ours is silent.
 
-    Purely diagnostic: it never redirects telemetry on its own, it just
-    reports where traffic is actually landing so a port mismatch shows up
-    as a clear message instead of silence. Ports it cannot bind are
-    skipped, since something else legitimately owning them is not an error.
+    Purely diagnostic: it never redirects telemetry, it just reports where
+    traffic is actually landing so a port mismatch shows up as a clear
+    message instead of silence.
+
+    It borrows those ports rather than owning them, and that distinction is
+    the whole design. A UDP bind here is exclusive, so anything this holds
+    is denied to everyone else: a second copy of this app, SimHub, a dash
+    overlay - and, worst of all, if the game turns out to be sending to a
+    candidate port, this scanner would be the process receiving those
+    packets and dropping them on the floor. So it:
+
+      * waits before binding anything, giving the real port first refusal;
+      * only runs while `is_needed()` says the real port has had nothing;
+      * releases every socket the instant telemetry arrives, or once it has
+        located the traffic.
+
+    Ports it cannot bind are skipped - something else legitimately owning
+    one is not an error.
     """
 
-    def __init__(self, exclude: int, on_found: Callable[[int], None]) -> None:
+    #: Grace period before borrowing anything, so a normally-working setup
+    #: never binds these ports at all.
+    START_DELAY = 3.0
+    POLL = 0.5
+
+    def __init__(
+        self,
+        exclude: int,
+        on_found: Callable[[int], None],
+        is_needed: Callable[[], bool] | None = None,
+    ) -> None:
         self._exclude = exclude
         self._on_found = on_found
+        self._is_needed = is_needed or (lambda: True)
         self._running = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -345,7 +374,21 @@ class _PortScanner:
             self._thread.join(timeout=1.5)
             self._thread = None
 
+    def _wait(self, seconds: float) -> bool:
+        """Sleep in small slices so stop() stays responsive."""
+        deadline = time.monotonic() + seconds
+        while self._running.is_set() and time.monotonic() < deadline:
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        return self._running.is_set()
+
     def _run(self) -> None:
+        # Give the configured port a clear head start. If telemetry is
+        # arriving normally we never touch another port at all.
+        if not self._wait(self.START_DELAY):
+            return
+        if not self._is_needed():
+            return
+
         sockets: list[socket.socket] = []
         by_socket: dict[socket.socket, int] = {}
 
@@ -364,10 +407,18 @@ class _PortScanner:
         if not sockets:
             return
 
+        _log.debug(
+            "Port scan active on %s while UDP %d is silent",
+            sorted(by_socket.values()), self._exclude,
+        )
         try:
             while self._running.is_set():
+                # Real telemetry showed up - stop holding other people's ports.
+                if not self._is_needed():
+                    _log.debug("Telemetry arrived on %d; releasing scanned ports", self._exclude)
+                    return
                 try:
-                    readable, _, _ = select.select(sockets, [], [], 0.5)
+                    readable, _, _ = select.select(sockets, [], [], self.POLL)
                 except (OSError, ValueError):
                     return
                 for sock in readable:
@@ -376,7 +427,10 @@ class _PortScanner:
                     except OSError:
                         continue
                     if data:
+                        # Report once and release: continuing to hold the
+                        # port would keep stealing the game's packets.
                         self._on_found(by_socket[sock])
+                        return
         finally:
             for sock in sockets:
                 try:

@@ -1,9 +1,9 @@
 """Dark theme: palette constants and the application stylesheet.
 
-Colour is used as information, not decoration. Red is the accent and also
-means "stop"; teal means live/connected; amber means degraded; grey means
-inactive. Nothing is coloured just to look busy - on a page you glance at
-mid-corner, every splash of colour has to mean something.
+Colour is used as information, not decoration. Teal means live/healthy,
+amber means degraded, red means a problem, grey means inactive. Nothing is
+coloured just to look busy - on a page you glance at mid-corner, every
+splash of colour has to mean something.
 """
 
 from __future__ import annotations
